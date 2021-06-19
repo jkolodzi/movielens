@@ -1,6 +1,26 @@
-###################################################################################################################################
-# BEGIN given code to create edx and validation sets
-###################################################################################################################################
+---
+title: "Movie Prediction System"
+author: "Justin A. Kolodziej"
+date:
+output: pdf_document
+---
+
+# 1. Introduction
+
+A key feature of a movie streaming service such as NetFlix® is to recommend movies
+to users that they will rate highly based on their own ratings and the ratings of 
+other users. The goal of the project is to develop a machine learning algorithm
+that will minimize root mean squared error (RMSE target <= 0.8649) of movie ratings on a scale of
+0 to 5 stars, using the 10 million rating version of the MovieLens database. Multiple
+methods are used to identify patterns in a representative subsample of the data, and
+algorithms and tuning parameters selected that run in a reasonable time and give
+reasonably accurate results. In the end a hybrid approach is selected and run on the
+full dataset.
+
+# 2. Methods/Analysis
+
+```{r, download-data, echo=FALSE, results="hide",message=FALSE,warning=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE)
 ##########################################################
 # Create edx set, validation set (final hold-out test set)
 ##########################################################
@@ -56,9 +76,22 @@ removed <- anti_join(temp, validation)
 edx <- rbind(edx, removed)
 
 rm(dl, ratings, movies, test_index, temp, movielens, removed)
-###################################################################################################################################
-# END given code to create edx and validation sets
-###################################################################################################################################
+```
+The MovieLens data set contains the following columns:
+```{r, print-names,echo=FALSE}
+head(edx)
+```
+The "userid", "movieid", "rating", and "title" columns appear straightforward, while 
+the "timestamp" and "genres" columns could use additional processing. There might be 
+patterns in the year/month/day of rating at least, as well as whether a movie is or is 
+not a drama, action, crime, etc. movie, and it may simplify analysis over having 
+separate levels of a factor for "Action" vs. "Action|Adventure". The lack of movies in
+many genres, e.g. "Action|Adventure|Comedy|Horror|Crime|Western|Sci-Fi|Fantasy|IMAX"
+means that adding these columns adds to the storage requirements.
+
+The "edx" dataset portion is split into a "train" and "test" set with 80% of the data in the "train" and 20% in the "test" dataset for analysis.
+
+```{r, create-wrangle-train-test, echo=FALSE, results="hide"}
 ###################################################################################################################################
 # BEGIN transformation of edx data
 ###################################################################################################################################
@@ -119,7 +152,19 @@ wrangle <- function(ratings) {
 }
 train <- wrangle(train)
 test <- wrangle(test)
+```
+```{r graph-tree, echo=FALSE}
+head(train)
+head(test)
+```
+##2.1 Exploration with regression trees
 
+Since the wrangled dataset now has a large number of binary predictors, a regression
+tree would seem to be a natural choice to determine which predictors are more important
+in predicting movie ratings. By using a large complexity parameter (cp = .0025) the
+tree can be made simple enough to graph as a starting point.
+
+```{r print-test-train, echo=FALSE}
 #train() function is taking too much memory/time on this dataset. I wrote functions to tune by cp and minsplit manually.
 rpart_predict <- function(cp, train, test) {
     library(rpart)
@@ -148,20 +193,43 @@ fit <- rpart(rating ~ ., data=train, control=rpart.control(cp = .0025, maxsurrog
 plot(fit, margin = 0.1)
 text(fit, cex = 0.75)
 print(fit$variable.importance)
+```
+Most of the splits are by genre, so at a gross level using genre to predict rating 
+appears to be a reasonable idea.
 
+The regression tree can be tuned by minimum node size in addition to complexity 
+parameter. It seems preferable, in fact, to avoid situations where some nodes have only 
+a few observations and others have tens of thousands. Once an optimal node size is 
+found, the variable importance can be graphed to see what predictors are most useful.
+```{r tune-rpart, echo=FALSE}
 #rpart is fairly memory efficient so I can tune it in parallel to some degree.
 library(parallel)
 cl <- makeCluster(3)
 tune3 <- c(100000,50000,20000,10000,5000,2000,1000,500,200)
 rtree_tune3 <- parSapplyLB(cl, tune3, rpart_predict2, train, test)
 plot(tune3, rtree_tune3, type="b")
+cat("Best RMSE =", min(rtree_tune3), "\n")
 stopCluster(cl)
 
 #Best minsplit is 500, though the results are not great. Plot the variable importance.
 fit <- rpart(rating ~ ., data=train, control=rpart.control(cp = 0,minsplit = 500, maxsurrogate=0))
-print(fit$variable.importance)
 barplot(fit$variable.importance, las=2)
 
+```
+
+
+The best prediction appears to be a minsplit of 500 and the best predictors at that 
+level appear to be movieId, releaseyear, Drama, and week. However the minimum RMSE is 
+>0.94 so other approaches will be needed.
+
+## 2.2 Least-squares regression
+Perhaps other methods focusing on the most important variables found by the regression
+tree will give improved results without an extraordinary compute time or storage
+requirement. Also, another approach might be to use least-squares on the userId and
+movieId without any other knowledge of the dataset. All are compared to merely
+predicting the mean of all ratings for every observation.
+
+```{r least-squares-comparison, echo=FALSE}
 #least squares predictions
 mu_predict <- function(train, test) {
     mu <- mean(train$rating)
@@ -282,7 +350,18 @@ results <- rbind(results, data.frame(method = "Movies+ReleaseYear", RMSE = relea
 results <- rbind(results, data.frame(method = "Movies+ReleaseYear+Drama", RMSE = week_releaseyear_movie_predict(train, test)))
 results <- rbind(results, data.frame(method = "Movies+ReleaseYear+Drama+Week", RMSE = drama_week_releaseyear_movie_predict(train, test)))
 print(results)
+```
 
+Note that MovieId + UserId is much better than any of the MovieId plus other options.
+
+## 2.3 Penalized Least Squares and multiple lambdas
+
+Penalized (or normalized) least squares reduces the influence of predictor means with 
+few samples. Standard penalized least squares has one penalty parameter (lambda); there
+is no reason not to use one lambda per predictor (movieId and userId). These lambdas
+can be tuned to the training set and the results graphed as a contour plot:
+
+```{r penalized-tune, echo=FALSE}
 user_movie_effects_penalized <- function(train, lambda1, lambda2) {
     mu <- mean(train$rating)
     user_effects <- train %>% group_by(userId) %>%
@@ -341,14 +420,24 @@ penalized_tune <- cbind(penalized_tune, parSapplyLB(cl,seq(0,20,.5), user_movie_
 penalized_tune <- cbind(penalized_tune, parSapplyLB(cl,seq(0,20,.5), user_movie_effects_penalized_predict, 9.5, train, test))
 penalized_tune <- cbind(penalized_tune, parSapplyLB(cl,seq(0,20,.5), user_movie_effects_penalized_predict, 10.0, train, test))
 stopCluster(cl)
-print(penalized_tune)
+#print(penalized_tune)
 filled.contour(seq(0,20,.5),seq(0,10,.5),penalized_tune,xlab="lambda1",ylab="lambda2")
+```
 
+The optimal lambda1 is 17.5 and lambda2 is 2.5. The RMSE with those parameters is: 
+
+```{r penalized-predict, echo=FALSE}
 lambda1 <- 17.5
 lambda2 <- 2.5
 pm_RMSE <- user_movie_effects_penalized_predict(lambda1, lambda2, train, test)
-cat("hybrid model 1 RMSE = ", pm_RMSE, "\n")
+cat("penalized model RMSE = ", pm_RMSE, "\n")
+```
 
+## 2.3 Hybrid approaches
+
+After using the penalized least-squared prediction algorithm, there is still a residual left over. This can be subtracted out and the residuals predicted or analyzed using another algorithm. First the regression tree is tried.
+
+```{r hybrid-model-1-analyze, echo=FALSE}
 mu <- mean(train$rating)
 user_effects <- train %>% group_by(userId) %>%
                           summarize(u_effect = sum(rating-mu)/(n()+lambda1))
@@ -364,9 +453,12 @@ fit <- rpart(residual ~ ., data=train2, control=rpart.control(cp = .0002, maxsur
 plot(fit, margin = 0.1)
 text(fit, cex = 0.75)
 fit <- rpart(residual ~ ., data=train2, control=rpart.control(cp = 0,minsplit=500, maxsurrogate=0))
-print(fit$variable.importance)
 barplot(fit$variable.importance, las=2)
+```
 
+Then the RMSE for the train and test set using the original tuning is:
+
+```{r hybrid-model-1-predict, echo=FALSE}
 y_hat <- test %>% left_join(user_effects, by="userId") %>% 
                   left_join(movie_effects, by="movieId") %>%
                   mutate(y_hat = mu+u_effect+m_effect) %>%
@@ -374,12 +466,18 @@ y_hat <- test %>% left_join(user_effects, by="userId") %>%
 test2 <- test %>% mutate(residual=rating-y_hat) %>% select(-userId,-movieId,-rating)
 hm1_RMSE <- RMSE(test$rating, y_hat+predict(fit, newdata=test2))
 cat("hybrid model 1 RMSE = ", hm1_RMSE, "\n")
+```
+```{r gc1, echo=FALSE, results="hide"}
 rm(user_effects,movie_effects,y_hat,train2,test2,fit)
 gc()
+```
 
+The tuning for the minsplit parameter may be different for the residual vs. the
+original ratings, though.
 
+```{r hybrid-model-1-retune, echo=FALSE}
 hybrid_model_1_predict <- function(minsplit, train, test) {
-    gc()
+    g <- gc()
     library(dplyr)
     library(rpart)
     lambda1 <- 17.5
@@ -396,7 +494,6 @@ hybrid_model_1_predict <- function(minsplit, train, test) {
                       pull(y_hat)
     train <- train %>% mutate(residual = rating - y_hat)
     fit <- rpart(residual ~ .-rating-userId-movieId, data=train, control=rpart.control(cp = 0,minsplit=minsplit, maxsurrogate=0))
-    print(fit$variable.importance)
     y_hat <- test %>% left_join(user_effects, by="userId") %>% 
                       left_join(movie_effects, by="movieId") %>%
                       mutate(y_hat = mu+u_effect+m_effect) %>%
@@ -412,12 +509,10 @@ tune3 <- c(100000,50000,20000,10000,5000,2000,1000,500,200)
 hybrid_1_tune <- parSapplyLB(cl, tune3, hybrid_model_1_predict, train, test)
 plot(tune3, hybrid_1_tune, type="b")
 stopCluster(cl)
-gc()
 rmse_1 <- hybrid_model_1_predict(2000,train, test)
 cat("Model with penalized effects plus tree, RMSE=", rmse_1, "\n")
-
 hybrid_model_1 <- function(minsplit, train, test) {
-    gc()
+    g <- gc()
     library(dplyr)
     library(rpart)
     lambda1 <- 17.5
@@ -437,14 +532,26 @@ hybrid_model_1 <- function(minsplit, train, test) {
     return(fit)
 }
 fit <- hybrid_model_1(2000,train,test)
-print(fit$variable.importance)
 barplot(fit$variable.importance, las=2)
+```
+
+```{r gc,echo=FALSE,results="hide"}
 rm(fit)
 gc()
+```
 
+## 2.4 Generalized Additive Model (GAM)
+
+An alternative to the regression tree is a Generalized Additive Model. A GAM is an
+extension of a GLM (Generalized Linear Model) except smooth functions of 
+predictors such as cubic splines are fitted to the data rather than linear functions,
+giving more flexibility. R has an efficient algorithm to train and predict GAM models
+so it can be used on the most important predictors from the regression tree results.
+
+```{r gam-predict, echo=FALSE}
 # Try a generalized additive model on the 3 most important variables from the residual
 hybrid_model_2 <- function(train, test) {
-    gc()
+    g <- gc()
     library(mgcv)
     library(dplyr)
     library(parallel)
@@ -471,7 +578,7 @@ fit <- hybrid_model_2(train,test)
 print(summary(fit))
 
 hybrid_model_2_predict <- function(train, test) {
-    gc()
+    g <- gc()
     library(mgcv)
     library(dplyr)
     library(parallel)
@@ -492,7 +599,6 @@ hybrid_model_2_predict <- function(train, test) {
     train <- train %>% mutate(residual = rating - y_hat)
     fit <- bam(residual ~ s(as.numeric(week),bs="cs")+s(releaseyear,bs="cs")+s(day,bs="cs"),
                data=train, gc.level=2, cluster=cl)
-    print(fit$variable.importance)
     y_hat <- test %>% left_join(user_effects, by="userId") %>% 
                       left_join(movie_effects, by="movieId") %>%
                       mutate(y_hat = mu+u_effect+m_effect) %>%
@@ -505,13 +611,41 @@ hybrid_model_2_predict <- function(train, test) {
     return(RMSE(test$rating, y_hat))
 }
 rmse_2 <- hybrid_model_2_predict(train, test)
-cat("Model with penalized effects plus GAM, RMSE=", rmse_2)
+cat("Model with penalized effects plus GAM, RMSE=", rmse_2, "\n")
 rm(train,test)
+```
 
+The GAM results for 3 individual predictors are not quite as good as the results for
+the regression tree with all remaining predictors (minus movieId and userId).
+
+# 3 Results
+
+The best results so far are from penalized regression on userId and movieId and a
+regression tree for the residual from the rest of the predictors. Training this model
+on the full edx set to predict the validation set gives a result:
+
+```{r final-wrangle, echo=FALSE, results="hide"}
 #Use model 1 (penalized least squares plus regression tree) to predict validation set
 gc()
 edx <- wrangle(edx)
 validation <- wrangle(validation)
- 
+```
+```{r final_predict, echo=FALSE}
 final_RMSE <- hybrid_model_1_predict(2000,edx, validation)
-cat("Final RMSE for full edx/validation sets = ", final_RMSE)
+cat("Final RMSE for full edx/validation sets = ", final_RMSE, "\n")
+```
+
+This is not as good as the .859 target.
+
+# 4 Conclusion
+
+A hybrid approach with 2 levels of prediction was able to achieve a better result
+than either algorithm alone, but not to the level required by the parameters of
+the project. However, other approaches exist that were not implemented due to time
+and resource constraints. Based on the results, one called gradient boosting trees
+that iterates building regression trees on the residuals of the previous tree seems
+promising, though overtraining seems likely.
+
+GAM has a large number of options for building a model; only a model of form
+f(x)+f(y)+f(z) was used when models such as f(x)+f(y)+f(z)+g(x,y,z), etc. are 
+permissible. Exploring them may give the model additional predictive power.
